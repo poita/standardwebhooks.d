@@ -43,6 +43,12 @@ enum string headerTimestamp = wireHeaderTimestamp;
 /// Canonical Standard Webhooks header carrying the space-delimited signatures.
 enum string headerSignature = wireHeaderSignature;
 
+/// Request header carrying an endpoint verification challenge (the endpoint
+/// verification extension). See $(LREF Webhook.endpointVerificationResponse).
+enum string headerChallenge = wireHeaderChallenge;
+/// Response header carrying the answer to an endpoint verification challenge.
+enum string headerChallengeResponse = wireHeaderChallengeResponse;
+
 /// The default timestamp tolerance: five minutes, applied symmetrically.
 enum long defaultToleranceSeconds = 5 * 60;
 
@@ -257,6 +263,59 @@ struct Webhook
 		return VerifyResult(false, WebhookError.noMatch);
 	}
 
+	/**
+	 * Calculates the response to an endpoint verification challenge, per the
+	 * Standard Webhooks endpoint verification (WEV) extension.
+	 *
+	 * Takes the value of the `webhook-challenge` request header exactly as
+	 * received and returns the value for the `webhook-challenge-response`
+	 * response header (`v1,<base64>`). A request carrying a challenge is not a
+	 * webhook delivery: respond (e.g. `204 No Content`) without processing its
+	 * body. Respond even if verifying the request fails; the response is only
+	 * useful for passing verification of this endpoint.
+	 *
+	 * ---
+	 * auto challenge = lookup(request.headers, headerChallenge);
+	 * if (challenge.length)
+	 *     response.headers[headerChallengeResponse] = wh.endpointVerificationResponse(challenge);
+	 * ---
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) with
+	 *   `emptySecret` for a `Webhook.init` that has no key.
+	 */
+	string endpointVerificationResponse(scope const(char)[] challenge) const
+	{
+		if (key.length == 0)
+			throw new WebhookException("Empty signing key", WebhookError.emptySecret);
+		return signatureVersion ~ "," ~ endpointVerificationSignature(key, challenge);
+	}
+
+	/**
+	 * Producer side of endpoint verification: whether `response`, the
+	 * `webhook-challenge-response` header an endpoint returned, is the correct
+	 * answer to `challenge`. The whole value, including the `v1,` identifier, is
+	 * compared in constant time; anything else (a list, another version) fails.
+	 * Producers with several active secrets call this once per secret.
+	 */
+	bool isValidEndpointVerificationResponse(scope const(char)[] challenge,
+			scope const(char)[] response) const
+	{
+		return constantTimeEquals(response, endpointVerificationResponse(challenge));
+	}
+
+	/**
+	 * Like $(LREF isValidEndpointVerificationResponse) but throws on mismatch.
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) with
+	 *   `noMatch` if `response` is not the expected value.
+	 */
+	void verifyEndpointVerificationResponse(scope const(char)[] challenge,
+			scope const(char)[] response) const
+	{
+		if (!isValidEndpointVerificationResponse(challenge, response))
+			throw new WebhookException("No matching signature found", WebhookError.noMatch);
+	}
+
 	/// Computes the bare base64 HMAC-SHA256 signature (without the `v1,` prefix).
 	/// Rejects an empty key, which catches `Webhook.init` whose key was never
 	/// set; signing or verifying with it would yield a worthless signature.
@@ -278,19 +337,6 @@ private string hmacBase64(scope const(ubyte)[] key, scope const(char)[] content)
 	mac.put(cast(const(ubyte)[]) content);
 	auto digest = mac.finish();
 	return Base64.encode(digest[]).idup;
-}
-
-/// Length-checked, non-short-circuiting byte comparison. A length mismatch
-/// returns immediately (as in every reference library); equal-length inputs are
-/// compared in time independent of where they first differ.
-private bool constantTimeEquals(scope const(char)[] a, scope const(char)[] b) @safe @nogc nothrow pure
-{
-	if (a.length != b.length)
-		return false;
-	uint diff = 0;
-	foreach (i; 0 .. a.length)
-		diff |= cast(uint)(a[i] ^ b[i]);
-	return diff == 0;
 }
 
 // --- Tests ------------------------------------------------------------------
@@ -892,4 +938,47 @@ version (unittest)
 	auto wh = Webhook(vecSecret).withTolerance(2000);
 	auto headers = wh.signHeaders(vecId, old, vecPayload);
 	assert(wh.verify(vecPayload, headers) == vecPayload);
+}
+
+/// Endpoint verification: the spec's symmetric example vector.
+@safe unittest
+{
+	auto wh = Webhook("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw");
+	enum challenge = "0njH7N3kV5eXPB+/eh+eoA2Ahvz2JgNp0iC/BLOl6yM=";
+	enum expected = "v1,2WoO4Z1kjgoudcvk4PX/8LDD6FNJDEUHMtYqZpNx/FA=";
+	assert(wh.endpointVerificationResponse(challenge) == expected);
+	assert(wh.isValidEndpointVerificationResponse(challenge, expected));
+	wh.verifyEndpointVerificationResponse(challenge, expected);
+}
+
+/// Endpoint verification rejects a wrong challenge, a list of signatures, another
+/// version identifier, and another secret's response.
+@safe unittest
+{
+	import std.exception : collectException;
+
+	auto wh = Webhook("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw");
+	enum challenge = "0njH7N3kV5eXPB+/eh+eoA2Ahvz2JgNp0iC/BLOl6yM=";
+	enum expected = "v1,2WoO4Z1kjgoudcvk4PX/8LDD6FNJDEUHMtYqZpNx/FA=";
+	assert(!wh.isValidEndpointVerificationResponse("wrong-challenge", expected));
+	assert(!wh.isValidEndpointVerificationResponse(challenge, "v2,abc " ~ expected));
+	assert(!wh.isValidEndpointVerificationResponse(challenge, "v1a" ~ expected[2 .. $]));
+	assert(!wh.isValidEndpointVerificationResponse(challenge, ""));
+
+	auto other = Webhook("whsec_C2FVsBQIhrscChlQIMV+b5sSYspob7oD");
+	assert(!other.isValidEndpointVerificationResponse(challenge, expected));
+
+	auto ex = collectException!WebhookException(
+			wh.verifyEndpointVerificationResponse("wrong-challenge", expected));
+	assert(ex !is null && ex.error == WebhookError.noMatch);
+}
+
+/// A key-less Webhook.init cannot answer a challenge.
+@safe unittest
+{
+	import std.exception : collectException;
+
+	Webhook wh;
+	auto ex = collectException!WebhookException(wh.endpointVerificationResponse("abc"));
+	assert(ex !is null && ex.error == WebhookError.emptySecret);
 }
