@@ -40,6 +40,9 @@ enum WebhookError
 	/// signals a server/library fault rather than a bad request, so a receiver
 	/// should map it to a 5xx, not a 400.
 	cryptoFailure,
+	/// An asymmetric `v2a` endpoint ID was empty or contained a `.`.
+	/// (raised only by standardwebhooks:ed25519)
+	invalidEndpointId,
 }
 
 /// The outcome of a non-throwing verification. On success `ok` is true and

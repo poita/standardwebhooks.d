@@ -1,7 +1,13 @@
 /**
  * Asymmetric (ed25519) Standard Webhooks signing and verification.
  *
- * This is the spec's `v1a` signature scheme: the same
+ * The spec's current asymmetric scheme is `v2a`, provided by
+ * $(LREF AsymmetricVerifier) and $(LREF AsymmetricSigner): it signs a SHA-256
+ * digest of `{endpointId}.{id}.{timestamp}.{payload}`, so one key pair can serve
+ * every endpoint and the key can live in a KMS or HSM.
+ *
+ * $(LREF AsymmetricWebhook) implements the earlier `v1a` scheme, which the spec
+ * now deprecates: the same
  * `{id}.{timestamp}.{payload}` content as the symmetric `v1` scheme, signed with
  * an ed25519 private key and verified with the matching public key. Unlike the
  * symmetric scheme, the verifier holds only a public key, so a leaked verifier
@@ -358,6 +364,472 @@ struct AsymmetricWebhook
 	}
 }
 
+// --- v2a: endpoint-bound signatures over a SHA-256 digest -------------------
+
+/// The signature version tag of the current asymmetric scheme.
+private enum string asymmetricV2Version = "v2a";
+
+/// DER prefix of an ed25519 SubjectPublicKeyInfo, followed by the raw 32-byte
+/// public key (the form AWS KMS `GetPublicKey` returns, for example).
+private immutable ubyte[12] ed25519SpkiPrefix = [
+	0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00
+];
+
+/**
+ * Verifies webhooks signed with the spec's asymmetric `v2a` scheme.
+ *
+ * `v2a` signs `SHA-256("{endpointId}.{id}.{timestamp}.{payload}")` with pure
+ * ed25519. Because the endpoint ID is part of the signed content, one key pair
+ * can serve every endpoint (the spec recommends one per environment) and can
+ * live in a KMS or HSM, without a webhook for one endpoint being replayable to
+ * another. The producer shares the endpoint ID with the consumer alongside the
+ * public key; it is never sent with the webhook.
+ *
+ * Constructed with the endpoint ID and the list of trusted `whpk_` public keys,
+ * newest first. A webhook verifies if any `v2a` entry in its
+ * `webhook-signature` header was made by any trusted key, so a producer rotates
+ * keys by having consumers add the new key to the front of the list. Other
+ * signature versions (`v1`, the deprecated `v1a`) are skipped.
+ *
+ * Example:
+ * ---
+ * auto verifier = AsymmetricVerifier("ep_2fVZdC8Kx9TR4ZoCqHWt3NnLgRb",
+ *     "whpk_uWKK13PfwqyOgrqT0OrWKcS2uVD7e89+oUKnkoPjx7w=");
+ * verifier.verify(payload, headers);
+ * ---
+ */
+struct AsymmetricVerifier
+{
+	private string endpointId_;
+	private immutable(ubyte)[][] publicKeys;
+
+	/// The timestamp tolerance window in unix seconds, as for
+	/// $(LREF AsymmetricWebhook.toleranceSeconds).
+	long toleranceSeconds = defaultToleranceSeconds;
+
+	/**
+	 * Builds a verifier for the endpoint `endpointId` trusting `publicKeys`, each
+	 * a `whpk_`-prefixed base64 ed25519 public key, ordered newest first.
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) with
+	 *   `invalidEndpointId` if `endpointId` is empty or contains a `.`,
+	 *   `emptySecret` if no key is given, or `invalidSecret` if a key lacks the
+	 *   `whpk_` prefix, is not valid base64 or is not 32 bytes.
+	 */
+	this(string endpointId, scope const(string)[] publicKeys...)
+	{
+		requireValidEndpointId(endpointId);
+		if (publicKeys.length == 0)
+			throw new WebhookException("At least one public key is required",
+					WebhookError.emptySecret);
+
+		foreach (key; publicKeys)
+		{
+			if (!hasPrefix(key, publicKeyPrefix))
+				throw new WebhookException("Public key must be prefixed with whpk_",
+						WebhookError.invalidSecret);
+			auto bytes = decodePrefixedKey(key, publicKeyPrefix);
+			if (bytes.length != publicKeyBytes)
+				throw new WebhookException("Invalid ed25519 public key length",
+						WebhookError.invalidSecret);
+			this.publicKeys ~= bytes;
+		}
+		this.endpointId_ = endpointId;
+	}
+
+	/// Builds a verifier from raw 32-byte ed25519 public keys, newest first.
+	///
+	/// Throws: as the string constructor, with `invalidSecret` for a key that is
+	///   not exactly 32 bytes.
+	static AsymmetricVerifier fromRawPublicKeys(string endpointId,
+			scope const(ubyte[])[] publicKeys...)
+	{
+		requireValidEndpointId(endpointId);
+		if (publicKeys.length == 0)
+			throw new WebhookException("At least one public key is required",
+					WebhookError.emptySecret);
+
+		AsymmetricVerifier v;
+		foreach (pk; publicKeys)
+		{
+			if (pk.length != publicKeyBytes)
+				throw new WebhookException("ed25519 public key must be 32 bytes",
+						WebhookError.invalidSecret);
+			v.publicKeys ~= pk.idup;
+		}
+		v.endpointId_ = endpointId;
+		return v;
+	}
+
+	/// The endpoint ID this verifier checks signatures for.
+	string endpointId() const
+	{
+		return endpointId_;
+	}
+
+	/// Returns a copy with its timestamp tolerance set to `seconds`, sharing the
+	/// same keys.
+	AsymmetricVerifier withTolerance(long seconds) const
+	{
+		AsymmetricVerifier v;
+		v.endpointId_ = endpointId_;
+		v.publicKeys = cast(immutable(ubyte)[][]) publicKeys.dup;
+		v.toleranceSeconds = seconds;
+		return v;
+	}
+
+	/**
+	 * Verifies that `payload` carries a valid `v2a` signature for the given
+	 * headers and that its timestamp is within tolerance of now. Header matching
+	 * is as in $(LREF AsymmetricWebhook.verify).
+	 *
+	 * Returns: `payload` unchanged, for convenient chaining.
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) if a required
+	 *   header is missing, the timestamp is unparseable or outside tolerance, no
+	 *   signature matches, or libsodium fails to initialise (`cryptoFailure`,
+	 *   which should map to a 5xx rather than a 400).
+	 */
+	const(char)[] verify(scope return const(char)[] payload, in string[string] headers) const
+	{
+		return throwOnFailure(tryVerify(payload, headers));
+	}
+
+	/// Like $(LREF verify) but skips the timestamp tolerance check. Use only when
+	/// replay protection is handled elsewhere.
+	const(char)[] verifyIgnoringTimestamp(scope return const(char)[] payload,
+			in string[string] headers) const
+	{
+		return throwOnFailure(tryVerifyIgnoringTimestamp(payload, headers));
+	}
+
+	/// Non-throwing $(LREF verify), returning a
+	/// $(REF VerifyResult, standardwebhooks,exception).
+	VerifyResult tryVerify(scope return const(char)[] payload, in string[string] headers) const
+	{
+		return tryVerifyAt(payload, headers, currentUnixSeconds(), true);
+	}
+
+	/// Non-throwing $(LREF verifyIgnoringTimestamp).
+	VerifyResult tryVerifyIgnoringTimestamp(scope return const(char)[] payload,
+			in string[string] headers) const
+	{
+		return tryVerifyAt(payload, headers, currentUnixSeconds(), false);
+	}
+
+	/// The non-throwing verification core, against an explicit `now`. Exposed for
+	/// deterministic testing of the tolerance window.
+	package VerifyResult tryVerifyAt(scope return const(char)[] payload,
+			in string[string] headers, long now, bool checkTimestamp) const
+	{
+		const(char)[] msgId, tsHeader, sigHeader;
+		WebhookError error;
+		if (!tryRequireHeaders(headers, now, checkTimestamp, toleranceSeconds,
+				msgId, tsHeader, sigHeader, error))
+			return VerifyResult(false, error);
+
+		if (publicKeys.length == 0)
+			return VerifyResult(false, WebhookError.emptySecret);
+
+		try
+			ensureSodiumInitialised();
+		catch (WebhookException e)
+			return VerifyResult(false, e.error);
+
+		// The timestamp header is used verbatim, as in the other schemes, so a
+		// sender's exact formatting round-trips.
+		const digest = v2aDigest(endpointId_, msgId, tsHeader, payload);
+
+		const matched = anySignature(sigHeader, (scope version_, scope signature) {
+			if (version_ != asymmetricV2Version)
+				return false;
+			foreach (pk; publicKeys)
+				if (verifyDetachedBytes(pk, digest[], signature))
+					return true;
+			return false;
+		});
+		if (matched)
+			return VerifyResult(true, WebhookError.init, payload);
+
+		return VerifyResult(false, WebhookError.noMatch);
+	}
+
+	/**
+	 * Calculates the response to an endpoint verification challenge, per the
+	 * Standard Webhooks endpoint verification (WEV) extension, using the first
+	 * (newest) public key. Takes the `webhook-challenge` header exactly as
+	 * received and returns the `webhook-challenge-response` value
+	 * (`v2a,<base64>`). See
+	 * $(REF Webhook.endpointVerificationResponse, standardwebhooks,webhook).
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) with
+	 *   `emptySecret` for an `AsymmetricVerifier.init` that has no key.
+	 */
+	string endpointVerificationResponse(scope const(char)[] challenge) const
+	{
+		if (publicKeys.length == 0)
+			throw new WebhookException("At least one public key is required",
+					WebhookError.emptySecret);
+		return challengeResponse(publicKeys[0], challenge);
+	}
+
+	/**
+	 * Producer side of endpoint verification: whether `response` is the correct
+	 * answer to `challenge` for any of the trusted keys. The whole value,
+	 * including the `v2a,` identifier, is compared in constant time.
+	 */
+	bool isValidEndpointVerificationResponse(scope const(char)[] challenge,
+			scope const(char)[] response) const
+	{
+		bool matched;
+		foreach (pk; publicKeys)
+			matched |= constantTimeEquals(response, challengeResponse(pk, challenge));
+		return matched;
+	}
+
+	/// Like $(LREF isValidEndpointVerificationResponse) but throws a
+	/// $(REF WebhookException, standardwebhooks,exception) with `noMatch` on
+	/// mismatch.
+	void verifyEndpointVerificationResponse(scope const(char)[] challenge,
+			scope const(char)[] response) const
+	{
+		if (!isValidEndpointVerificationResponse(challenge, response))
+			throw new WebhookException("No matching signature found", WebhookError.noMatch);
+	}
+
+	private string challengeResponse(scope const(ubyte)[] pk, scope const(char)[] challenge) const
+	{
+		// endpoint_key = public key bytes ‖ "." ‖ endpoint ID
+		const endpointKey = pk ~ cast(const(ubyte)[]) "." ~ cast(const(ubyte)[]) endpointId_;
+		return asymmetricV2Version ~ "," ~ endpointVerificationSignature(endpointKey, challenge);
+	}
+}
+
+/**
+ * Signs webhooks with the spec's asymmetric `v2a` scheme, using an ed25519
+ * private key held by the producer.
+ *
+ * A signer is not tied to an endpoint: one key pair serves all of them, and the
+ * endpoint ID is passed per signature. Producers holding the key in a KMS or
+ * HSM sign $(LREF asymmetricSignedContentHash) there instead and format the
+ * result with $(LREF formatAsymmetricSignature).
+ *
+ * Example:
+ * ---
+ * auto signer = AsymmetricSigner("whsk_4uKPjji/dhB8w6GW3YYDnIMYvXcdHrvH6lidTr4Z+EY=");
+ * auto headers = signer.signHeaders("ep_2fVZdC8Kx9TR4ZoCqHWt3NnLgRb",
+ *     "msg_2KWPBgLlAfxdpx2AI54pPJ85f4W", 1674087231, payload);
+ * string share = signer.publicKeyEncoded(); // give to consumers with the endpoint ID
+ * ---
+ */
+struct AsymmetricSigner
+{
+	private immutable(ubyte)[] secretKey; // libsodium seed ‖ public key, 64 bytes
+
+	/**
+	 * Builds a signer from a `whsk_` key. The spec serialises the 32-byte ed25519
+	 * seed; the 64-byte `seed ‖ public_key` form used by
+	 * $(LREF AsymmetricWebhook) is also accepted, so an existing `v1a` key pair
+	 * can move to `v2a` unchanged.
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) with
+	 *   `emptySecret` for an empty string, `invalidSecret` if the prefix is
+	 *   missing, the base64 is malformed, the length is wrong or a 64-byte key's
+	 *   public half does not match its seed, or `cryptoFailure` if libsodium
+	 *   fails.
+	 */
+	this(string key)
+	{
+		if (key.length == 0)
+			throw new WebhookException("Key can't be empty.", WebhookError.emptySecret);
+		if (!hasPrefix(key, signingKeyPrefix))
+			throw new WebhookException("Signing key must be prefixed with whsk_",
+					WebhookError.invalidSecret);
+
+		auto bytes = decodePrefixedKey(key, signingKeyPrefix);
+		if (bytes.length == seedBytes)
+			this = fromSeed(bytes);
+		else if (bytes.length == secretKeyBytes)
+		{
+			auto derived = fromSeed(bytes[0 .. seedBytes]);
+			if (derived.secretKey[seedBytes .. $] != bytes[seedBytes .. $])
+				throw new WebhookException(
+						"ed25519 signing key's public half does not match its seed",
+						WebhookError.invalidSecret);
+			this = derived;
+		}
+		else
+			throw new WebhookException("Invalid ed25519 signing key length",
+					WebhookError.invalidSecret);
+	}
+
+	/**
+	 * Builds a signer from a raw 32-byte ed25519 seed, which should come from a
+	 * cryptographically secure source.
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) with
+	 *   `invalidSecret` if `seed` is not 32 bytes, or `cryptoFailure`.
+	 */
+	static AsymmetricSigner fromSeed(scope const(ubyte)[] seed)
+	{
+		if (seed.length != seedBytes)
+			throw new WebhookException("ed25519 seed must be 32 bytes", WebhookError.invalidSecret);
+
+		ubyte[publicKeyBytes] pk;
+		ubyte[secretKeyBytes] sk;
+		if (()@trusted {
+				ensureSodiumInitialised();
+				return crypto_sign_seed_keypair(pk.ptr, sk.ptr, seed.ptr);
+			}() != 0)
+			throw new WebhookException("ed25519 key derivation failed", WebhookError.cryptoFailure);
+
+		AsymmetricSigner signer;
+		// As in AsymmetricWebhook.fromSeed, only the transient buffer is wiped.
+		signer.secretKey = sk.idup;
+		() @trusted { sodium_memzero(sk.ptr, sk.length); }();
+		return signer;
+	}
+
+	/// The public key in `whpk_` form: share it with consumers together with
+	/// each endpoint's ID.
+	string publicKeyEncoded() const
+	{
+		requireKey();
+		return publicKeyPrefix ~ Base64.encode(secretKey[seedBytes .. $]).idup;
+	}
+
+	/// The signing key in the spec's `whsk_` form (the base64 32-byte seed).
+	string signingKeyEncoded() const
+	{
+		requireKey();
+		return signingKeyPrefix ~ Base64.encode(secretKey[0 .. seedBytes]).idup;
+	}
+
+	/**
+	 * Signs `payload` for the endpoint `endpointId` and returns a single
+	 * `v2a,<base64>` entry for the `webhook-signature` header.
+	 *
+	 * Throws: $(REF WebhookException, standardwebhooks,exception) with
+	 *   `invalidEndpointId` for an empty endpoint ID or one containing `.`,
+	 *   `signingKeyRequired` for an `AsymmetricSigner.init`, or `cryptoFailure`.
+	 */
+	string sign(string endpointId, string msgId, long timestamp, scope const(char)[] payload) const
+	{
+		requireKey();
+		const digest = asymmetricSignedContentHash(endpointId, msgId, timestamp, payload);
+		return asymmetricV2Version ~ "," ~ signDetachedBytes(secretKey, digest[]);
+	}
+
+	/// Convenience overload taking a `SysTime`; truncates to unix seconds.
+	string sign(string endpointId, string msgId, SysTime timestamp, scope const(char)[] payload) const
+	{
+		return sign(endpointId, msgId, timestamp.toUnixTime(), payload);
+	}
+
+	/// Signs `payload` for `endpointId` and returns the three Standard Webhooks
+	/// headers for the outgoing request.
+	string[string] signHeaders(string endpointId, string msgId, long timestamp,
+			scope const(char)[] payload) const
+	{
+		return [
+			headerId: msgId,
+			headerTimestamp: timestamp.to!string,
+			headerSignature: sign(endpointId, msgId, timestamp, payload),
+		];
+	}
+
+	private void requireKey() const
+	{
+		if (secretKey.length == 0)
+			throw new WebhookException("A whsk_ signing key is required to sign",
+					WebhookError.signingKeyRequired);
+	}
+}
+
+/**
+ * The SHA-256 digest of the content a `v2a` signature covers,
+ * `{endpointId}.{msgId}.{timestamp}.{payload}`, as raw bytes.
+ *
+ * For producers that sign in a KMS or HSM: sign these 32 bytes with pure
+ * ed25519 and pass the signature to $(LREF formatAsymmetricSignature).
+ *
+ * Throws: $(REF WebhookException, standardwebhooks,exception) with
+ *   `invalidEndpointId` if `endpointId` is empty or contains a `.`.
+ */
+ubyte[32] asymmetricSignedContentHash(string endpointId, string msgId,
+		long timestamp, scope const(char)[] payload)
+{
+	requireValidEndpointId(endpointId);
+	return v2aDigest(endpointId, msgId, timestamp.to!string, payload);
+}
+
+/**
+ * Formats a raw 64-byte ed25519 signature as a `v2a,<base64>` entry for the
+ * `webhook-signature` header.
+ *
+ * Throws: $(REF WebhookException, standardwebhooks,exception) with
+ *   `invalidSecret` if `signature` is not 64 bytes.
+ */
+string formatAsymmetricSignature(scope const(ubyte)[] signature)
+{
+	if (signature.length != signatureBytes)
+		throw new WebhookException("ed25519 signature must be 64 bytes", WebhookError.invalidSecret);
+	return asymmetricV2Version ~ "," ~ Base64.encode(signature).idup;
+}
+
+/**
+ * Formats an ed25519 public key as `whpk_<base64>` to share with consumers.
+ * Accepts the raw 32-byte key or its DER-encoded SubjectPublicKeyInfo (what a
+ * KMS such as AWS KMS `GetPublicKey` returns).
+ *
+ * Throws: $(REF WebhookException, standardwebhooks,exception) with
+ *   `invalidSecret` for any other input.
+ */
+string formatAsymmetricPublicKey(scope const(ubyte)[] publicKey)
+{
+	if (publicKey.length == ed25519SpkiPrefix.length + publicKeyBytes)
+	{
+		if (publicKey[0 .. ed25519SpkiPrefix.length] != ed25519SpkiPrefix[])
+			throw new WebhookException("Not an ed25519 SubjectPublicKeyInfo",
+					WebhookError.invalidSecret);
+		publicKey = publicKey[ed25519SpkiPrefix.length .. $];
+	}
+	if (publicKey.length != publicKeyBytes)
+		throw new WebhookException("ed25519 public key must be 32 bytes",
+				WebhookError.invalidSecret);
+	return publicKeyPrefix ~ Base64.encode(publicKey).idup;
+}
+
+/// Rejects an endpoint ID the spec does not allow: empty, or containing `.`
+/// (which would make the signed content ambiguous).
+private void requireValidEndpointId(scope const(char)[] endpointId)
+{
+	import std.string : indexOf;
+
+	if (endpointId.length == 0 || endpointId.indexOf('.') >= 0)
+		throw new WebhookException("Endpoint ID may not be empty or contain '.'",
+				WebhookError.invalidEndpointId);
+}
+
+/// SHA-256 of `{endpointId}.{msgId}.{tsStr}.{payload}`, hashed incrementally so
+/// a large payload is not copied.
+private ubyte[32] v2aDigest(scope const(char)[] endpointId,
+		scope const(char)[] msgId, scope const(char)[] tsStr, scope const(char)[] payload)
+{
+	import std.digest.sha : SHA256;
+
+	SHA256 h;
+	h.start();
+	h.put(cast(const(ubyte)[]) endpointId);
+	h.put('.');
+	h.put(cast(const(ubyte)[]) msgId);
+	h.put('.');
+	h.put(cast(const(ubyte)[]) tsStr);
+	h.put('.');
+	h.put(cast(const(ubyte)[]) payload);
+	return h.finish();
+}
+
 // --- Dual-scheme verification -----------------------------------------------
 
 /**
@@ -485,6 +957,20 @@ private string signDetached(scope const(ubyte)[] sk, scope const(char)[] content
 		throw new WebhookException("ed25519 signing produced unexpected length",
 				WebhookError.cryptoFailure);
 	return Base64.encode(sig[0 .. siglen]).idup;
+}
+
+/// Produces the base64 ed25519 signature of the raw bytes `message` under the
+/// 64-byte secret key `sk`.
+private string signDetachedBytes(scope const(ubyte)[] sk, scope const(ubyte)[] message) @trusted
+{
+	return signDetached(sk, cast(const(char)[]) message);
+}
+
+/// Verifies a base64 ed25519 `signature` over the raw bytes `message`.
+private bool verifyDetachedBytes(scope const(ubyte)[] pk,
+		scope const(ubyte)[] message, scope const(char)[] signature) @trusted
+{
+	return verifyDetached(pk, cast(const(char)[]) message, signature);
 }
 
 /// Verifies a base64 ed25519 `signature` over `content` against public key `pk`.
@@ -1174,4 +1660,196 @@ version (unittest)
 	auto result = tryVerifyAnyIgnoringTimestamp(symmetric, asymmetric, vecPayload, headers);
 	assert(result.ok);
 	assert(result.payload == vecPayload);
+}
+
+// --- v2a tests ----------------------------------------------------------------
+// Vectors from the specification (standard-webhooks.md, "Asymmetric signatures",
+// and extensions/endpoint-verification.md, "Examples").
+
+version (unittest)
+{
+	private enum v2SecretKey = "whsk_4uKPjji/dhB8w6GW3YYDnIMYvXcdHrvH6lidTr4Z+EY=";
+	private enum v2PublicKey = "whpk_uWKK13PfwqyOgrqT0OrWKcS2uVD7e89+oUKnkoPjx7w=";
+	private enum v2EndpointId = "ep_2fVZdC8Kx9TR4ZoCqHWt3NnLgRb";
+	private enum v2Id = "msg_2KWPBgLlAfxdpx2AI54pPJ85f4W";
+	private enum v2Timestamp = 1_674_087_231L;
+	private enum v2Payload = `{"type":"contact.created","timestamp":"2022-11-03T20:26:10.344522Z","data":{"id":"1f81eb52-5198-4599-803e-771906343485"}}`;
+	private enum v2Hash = "YXCi5iN+rjB+iEb6bvg1XbWbVBL+r2S+as3k3n1Ih/A=";
+	private enum v2Signature = "v2a,kG9XaxZjAEpKB8KeQQb5G1Xp73YH5Rf5gxoWe7cg1kYMiyspdtZXe9w+dAwKeOurAwxfqmlOG/QR4m9s37DzAg==";
+	private enum v2Challenge = "0njH7N3kV5eXPB+/eh+eoA2Ahvz2JgNp0iC/BLOl6yM=";
+	private enum v2ChallengeResponse = "v2a,t0RDFhzk7OtVzgvMsjuXnodSWuby2BVX+zPqw2/ksUk=";
+
+	private string[string] v2Headers(string signature = v2Signature)
+	{
+		return [
+			headerId: v2Id,
+			headerTimestamp: v2Timestamp.to!string,
+			headerSignature: signature,
+		];
+	}
+}
+
+/// The signed-content hash and signature match the spec's example exactly.
+@safe unittest
+{
+	auto hash = asymmetricSignedContentHash(v2EndpointId, v2Id, v2Timestamp, v2Payload);
+	assert(Base64.encode(hash[]) == v2Hash);
+
+	auto signer = AsymmetricSigner(v2SecretKey);
+	assert(signer.publicKeyEncoded() == v2PublicKey);
+	assert(signer.signingKeyEncoded() == v2SecretKey);
+	assert(signer.sign(v2EndpointId, v2Id, v2Timestamp, v2Payload) == v2Signature);
+}
+
+/// The spec's example signature verifies for its endpoint, and not for another.
+@safe unittest
+{
+	auto verifier = AsymmetricVerifier(v2EndpointId, v2PublicKey);
+	assert(verifier.endpointId == v2EndpointId);
+	assert(verifier.tryVerifyAt(v2Payload, v2Headers(), v2Timestamp, true).ok);
+	assert(verifier.verifyIgnoringTimestamp(v2Payload, v2Headers()) == v2Payload);
+
+	auto other = AsymmetricVerifier("ep_other", v2PublicKey);
+	auto result = other.tryVerifyAt(v2Payload, v2Headers(), v2Timestamp, true);
+	assert(!result.ok && result.error == WebhookError.noMatch);
+}
+
+/// Timestamp tolerance applies as in the other schemes.
+@safe unittest
+{
+	auto verifier = AsymmetricVerifier(v2EndpointId, v2PublicKey);
+	auto result = verifier.tryVerifyAt(v2Payload, v2Headers(), v2Timestamp + 301, true);
+	assert(!result.ok && result.error == WebhookError.timestampTooOld);
+	assert(verifier.tryVerifyAt(v2Payload, v2Headers(), v2Timestamp + 301, false).ok);
+}
+
+/// A tampered payload or signature fails; v1a/v1 entries are skipped, and a v2a
+/// entry among them still matches.
+@safe unittest
+{
+	auto verifier = AsymmetricVerifier(v2EndpointId, v2PublicKey);
+	assert(!verifier.tryVerifyAt(v2Payload ~ " ", v2Headers(), v2Timestamp, true).ok);
+	assert(!verifier.tryVerifyAt(v2Payload,
+			v2Headers(v2Signature[0 .. $ - 4] ~ "AAg=="), v2Timestamp, true).ok);
+	assert(!verifier.tryVerifyAt(v2Payload,
+			v2Headers("v1a" ~ v2Signature[3 .. $]), v2Timestamp, true).ok);
+	assert(verifier.tryVerifyAt(v2Payload,
+			v2Headers("v1,K5oZfzN95Z9UVu1EsfQmfVNQhnkZ2pj9o9NDN/H/pI4= " ~ v2Signature),
+			v2Timestamp, true).ok);
+}
+
+/// Any trusted key verifies, so consumers can rotate keys.
+@safe unittest
+{
+	auto newSigner = AsymmetricSigner.fromSeed(new ubyte[32]);
+	auto verifier = AsymmetricVerifier(v2EndpointId, newSigner.publicKeyEncoded(), v2PublicKey);
+	assert(verifier.tryVerifyAt(v2Payload, v2Headers(), v2Timestamp, true).ok);
+
+	auto sig = newSigner.sign(v2EndpointId, v2Id, v2Timestamp, v2Payload);
+	assert(verifier.tryVerifyAt(v2Payload, v2Headers(sig), v2Timestamp, true).ok);
+	assert(!AsymmetricVerifier(v2EndpointId, v2PublicKey)
+			.tryVerifyAt(v2Payload, v2Headers(sig), v2Timestamp, true).ok);
+}
+
+/// signHeaders round-trips through the verifier.
+@safe unittest
+{
+	auto signer = AsymmetricSigner(v2SecretKey);
+	auto headers = signer.signHeaders(v2EndpointId, v2Id, v2Timestamp, v2Payload);
+	assert(headers[headerSignature] == v2Signature);
+	assert(AsymmetricVerifier(v2EndpointId, v2PublicKey).tryVerifyAt(v2Payload,
+			headers, v2Timestamp, true).ok);
+}
+
+/// The 64-byte `seed ‖ public_key` whsk_ form of AsymmetricWebhook is accepted,
+/// and normalised to the spec's 32-byte seed form; a mismatched public half is
+/// rejected.
+@safe unittest
+{
+	import std.exception : collectException;
+
+	auto legacy = AsymmetricWebhook.fromSeed(Base64.decode(v2SecretKey[5 .. $]));
+	auto signer = AsymmetricSigner(legacy.signingKeyEncoded());
+	assert(signer.signingKeyEncoded() == v2SecretKey);
+	assert(signer.sign(v2EndpointId, v2Id, v2Timestamp, v2Payload) == v2Signature);
+
+	auto bytes = Base64.decode(legacy.signingKeyEncoded()[5 .. $]);
+	bytes[$ - 1] ^= 1;
+	auto ex = collectException!WebhookException(
+			AsymmetricSigner("whsk_" ~ Base64.encode(bytes).idup));
+	assert(ex !is null && ex.error == WebhookError.invalidSecret);
+}
+
+/// Construction rejects bad endpoint IDs and keys.
+@safe unittest
+{
+	import std.exception : collectException;
+
+	WebhookError errorOf(lazy AsymmetricVerifier v)
+	{
+		auto ex = collectException!WebhookException(v);
+		assert(ex !is null);
+		return ex.error;
+	}
+
+	assert(errorOf(AsymmetricVerifier("", v2PublicKey)) == WebhookError.invalidEndpointId);
+	assert(errorOf(AsymmetricVerifier("ep.1", v2PublicKey)) == WebhookError.invalidEndpointId);
+	assert(errorOf(AsymmetricVerifier(v2EndpointId)) == WebhookError.emptySecret);
+	assert(errorOf(AsymmetricVerifier(v2EndpointId,
+			v2PublicKey[5 .. $])) == WebhookError.invalidSecret);
+	assert(errorOf(AsymmetricVerifier(v2EndpointId, "whpk_AAAA")) == WebhookError.invalidSecret);
+	assert(errorOf(AsymmetricVerifier(v2EndpointId, v2SecretKey)) == WebhookError.invalidSecret);
+
+	auto ex = collectException!WebhookException(AsymmetricSigner(v2SecretKey)
+			.sign("ep.1", v2Id, v2Timestamp, v2Payload));
+	assert(ex !is null && ex.error == WebhookError.invalidEndpointId);
+
+	ex = collectException!WebhookException(AsymmetricSigner(v2PublicKey));
+	assert(ex !is null && ex.error == WebhookError.invalidSecret);
+
+	AsymmetricSigner empty;
+	ex = collectException!WebhookException(empty.sign(v2EndpointId, v2Id, v2Timestamp, v2Payload));
+	assert(ex !is null && ex.error == WebhookError.signingKeyRequired);
+}
+
+/// HSM flow: hash, sign elsewhere, format. Public keys format from raw or SPKI.
+@safe unittest
+{
+	import std.exception : collectException;
+
+	auto raw = Base64.decode(v2Signature[4 .. $]);
+	assert(formatAsymmetricSignature(raw) == v2Signature);
+	assert(collectException!WebhookException(formatAsymmetricSignature(raw[0 .. 63])) !is null);
+
+	auto pk = Base64.decode(v2PublicKey[5 .. $]);
+	assert(formatAsymmetricPublicKey(pk) == v2PublicKey);
+	assert(formatAsymmetricPublicKey(ed25519SpkiPrefix[] ~ pk) == v2PublicKey);
+	auto badSpki = ed25519SpkiPrefix[].dup ~ pk;
+	badSpki[0] = 0;
+	assert(collectException!WebhookException(formatAsymmetricPublicKey(badSpki)) !is null);
+
+	assert(AsymmetricVerifier.fromRawPublicKeys(v2EndpointId, pk)
+			.tryVerifyAt(v2Payload, v2Headers(), v2Timestamp, true).ok);
+}
+
+/// Endpoint verification: the spec's asymmetric example vector, verified against
+/// any trusted key and rejected otherwise.
+@safe unittest
+{
+	auto verifier = AsymmetricVerifier(v2EndpointId, v2PublicKey);
+	assert(verifier.endpointVerificationResponse(v2Challenge) == v2ChallengeResponse);
+	assert(verifier.isValidEndpointVerificationResponse(v2Challenge, v2ChallengeResponse));
+	verifier.verifyEndpointVerificationResponse(v2Challenge, v2ChallengeResponse);
+
+	assert(!verifier.isValidEndpointVerificationResponse("wrong-challenge", v2ChallengeResponse));
+	assert(!verifier.isValidEndpointVerificationResponse(v2Challenge,
+			"v2,abc " ~ v2ChallengeResponse));
+	assert(!AsymmetricVerifier("ep_other", v2PublicKey)
+			.isValidEndpointVerificationResponse(v2Challenge, v2ChallengeResponse));
+
+	// A rotated-in key answers with the newest key; the producer accepts any.
+	auto newer = AsymmetricSigner.fromSeed(new ubyte[32]).publicKeyEncoded();
+	auto rotated = AsymmetricVerifier(v2EndpointId, newer, v2PublicKey);
+	assert(rotated.endpointVerificationResponse(v2Challenge) != v2ChallengeResponse);
+	assert(rotated.isValidEndpointVerificationResponse(v2Challenge, v2ChallengeResponse));
 }

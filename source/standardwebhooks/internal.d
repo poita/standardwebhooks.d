@@ -208,6 +208,8 @@ private string messageFor(WebhookError error)
 		return "A whsk_ signing key is required to sign";
 	case WebhookError.cryptoFailure:
 		return "Cryptographic operation failed";
+	case WebhookError.invalidEndpointId:
+		return "Endpoint ID may not be empty or contain '.'";
 	}
 }
 
@@ -323,6 +325,45 @@ immutable(ubyte)[] decodePrefixedKey(string value, string prefix)
 		return decodeStdBase64(b64);
 	catch (Exception)
 		throw new WebhookException("Invalid secret", WebhookError.invalidSecret);
+}
+
+/// Length-checked, non-short-circuiting byte comparison. A length mismatch
+/// returns immediately (as in every reference library); equal-length inputs are
+/// compared in time independent of where they first differ.
+bool constantTimeEquals(scope const(char)[] a, scope const(char)[] b) @safe @nogc nothrow pure
+{
+	if (a.length != b.length)
+		return false;
+	uint diff = 0;
+	foreach (i; 0 .. a.length)
+		diff |= cast(uint)(a[i] ^ b[i]);
+	return diff == 0;
+}
+
+/// Request header carrying an endpoint verification challenge.
+enum string wireHeaderChallenge = "webhook-challenge";
+/// Response header carrying the endpoint verification response.
+enum string wireHeaderChallengeResponse = "webhook-challenge-response";
+
+/// Key-domain label of the endpoint verification (WEV) extension.
+private enum string verificationKeyLabel = "wev-v1";
+
+/// The endpoint verification signature (without its version prefix):
+/// `base64(HMAC-SHA256(HMAC-SHA256(endpointKey, "wev-v1"), challenge))`, where
+/// `challenge` is the `webhook-challenge` header exactly as received.
+string endpointVerificationSignature(scope const(ubyte)[] endpointKey, scope const(char)[] challenge)
+{
+	import std.digest.hmac : HMAC;
+	import std.digest.sha : SHA256;
+
+	auto derive = HMAC!SHA256(endpointKey);
+	derive.put(cast(const(ubyte)[]) verificationKeyLabel);
+	auto verificationKey = derive.finish();
+
+	auto mac = HMAC!SHA256(verificationKey[]);
+	mac.put(cast(const(ubyte)[]) challenge);
+	auto digest = mac.finish();
+	return Base64.encode(digest[]).idup;
 }
 
 // --- Tests ---

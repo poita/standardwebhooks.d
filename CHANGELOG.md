@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- The specification's asymmetric `v2a` scheme in `standardwebhooks:ed25519`:
+  `AsymmetricVerifier` (endpoint ID plus a list of trusted `whpk_` keys, any of
+  which verifies) and `AsymmetricSigner` (accepts the spec's 32-byte `whsk_`
+  seed and the 64-byte form used by `AsymmetricWebhook`), plus
+  `asymmetricSignedContentHash`, `formatAsymmetricSignature` and
+  `formatAsymmetricPublicKey` for signing with a KMS or HSM. Verified against the
+  specification's example vectors.
+- The endpoint verification (WEV) extension: `endpointVerificationResponse`,
+  `isValidEndpointVerificationResponse` and `verifyEndpointVerificationResponse`
+  on `Webhook` (`v1`) and `AsymmetricVerifier` (`v2a`), and the
+  `headerChallenge`/`headerChallengeResponse` constants.
+- `WebhookError.invalidEndpointId`.
+
+### Deprecated
+
+- The specification now deprecates the `v1a` scheme in favour of `v2a`.
+  `AsymmetricWebhook` and `verifyAny` keep supporting it.
+
 ## [0.2.0] - 2026-06-14
 
 ### Added

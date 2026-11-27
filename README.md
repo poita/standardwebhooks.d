@@ -15,7 +15,9 @@ The core is **dependency-free** (Phobos only). Two optional subpackages extend
 it: [`standardwebhooks:vibe`](#vibed-integration) wires it directly into
 [vibe.d](https://vibed.org) HTTP requests, and
 [`standardwebhooks:ed25519`](#asymmetric-ed25519-signatures) adds the spec's
-asymmetric `v1a` signatures via libsodium.
+asymmetric `v2a` signatures (and the deprecated `v1a`) via libsodium. Both
+schemes support the spec's [endpoint verification](#endpoint-verification)
+extension.
 
 ## Why Standard Webhooks?
 
@@ -161,9 +163,10 @@ on `standardwebhooks:ed25519`; symmetric-only users link no libsodium.
 
 ## Asymmetric (ed25519) signatures
 
-The spec also defines an **asymmetric** scheme (`v1a`): the sender signs with an
+The spec also defines an **asymmetric** scheme: the sender signs with an
 ed25519 private key and receivers verify with the matching public key, so a
-leaked verifier cannot forge messages. This is provided by the optional
+leaked verifier cannot forge messages. The current scheme is `v2a`; the earlier
+`v1a` is deprecated by the spec but still supported here (see below). This is provided by the optional
 `standardwebhooks:ed25519` subpackage, which links the system **libsodium** for
 the ed25519 primitives (so it is kept out of the dependency-free core).
 
@@ -186,6 +189,39 @@ On Windows there is no system libsodium; install it with
 library is on the linker's `LIB` path and the matching DLL is on `PATH` at
 runtime — mirroring what CI does. The subpackage links `libsodium` via dub's
 `libs-windows`.
+
+### `v2a`
+
+`v2a` signs the SHA-256 hash of `{endpoint_id}.{id}.{timestamp}.{payload}`. The
+endpoint ID is assigned by the producer and shared with the consumer alongside
+the public key (it is not sent with the webhook), so one key pair can serve every
+endpoint and can be held in a KMS or HSM.
+
+```d
+import standardwebhooks;
+import standardwebhooks.ed25519;
+
+// Producer: one signer for all endpoints. whsk_ is the base64 32-byte seed.
+auto signer = AsymmetricSigner("whsk_...");
+auto headers = signer.signHeaders("ep_2fVZdC8Kx9TR4ZoCqHWt3NnLgRb", "msg_2b3c",
+    1614265330, `{"event":"ping"}`);
+// signer.publicKeyEncoded() is the whpk_ key to share with consumers.
+
+// Consumer: its endpoint ID and the trusted public keys, newest first. A
+// webhook signed by any of them verifies, so keys rotate without downtime.
+auto verifier = AsymmetricVerifier("ep_2fVZdC8Kx9TR4ZoCqHWt3NnLgRb", "whpk_...");
+auto payload = verifier.verify(`{"event":"ping"}`, headers);
+```
+
+`AsymmetricVerifier` has the same `verify`/`tryVerify` family, `toleranceSeconds`
+and header handling as `Webhook`. To sign with a key held in a KMS or HSM, sign
+`asymmetricSignedContentHash(endpointId, msgId, timestamp, payload)` there with
+pure ed25519 and pass the 64-byte result to `formatAsymmetricSignature`;
+`formatAsymmetricPublicKey` turns a raw or DER (SubjectPublicKeyInfo) public key
+into its `whpk_` form. `AsymmetricSigner` also accepts the 64-byte `whsk_` keys
+of `AsymmetricWebhook`, so an existing key pair can move to `v2a` unchanged.
+
+### `v1a` (deprecated)
 
 ```d
 import standardwebhooks;
@@ -233,6 +269,29 @@ auto payload = verifyAny(symmetric, asymmetric, body, headers);
 `verifyAnyIgnoringTimestamp` is the replay-window-skipping counterpart, matching
 the per-verifier `verifyIgnoringTimestamp`. Each verifier applies its own
 `toleranceSeconds`.
+
+## Endpoint verification
+
+The spec's [endpoint verification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/extensions/endpoint-verification.md)
+extension lets a producer confirm an endpoint consents to its webhooks: it sends
+a `webhook-challenge` header, and the endpoint answers with a
+`webhook-challenge-response` derived from its key. A challenge request is not a
+webhook delivery, so answer it without processing the body:
+
+```d
+// Consumer (Webhook for v1 secrets, AsymmetricVerifier for v2a keys).
+auto challenge = /* the webhook-challenge request header, if present */;
+if (challenge.length)
+{
+    response.headers[headerChallengeResponse] = wh.endpointVerificationResponse(challenge);
+    return; // 204 No Content
+}
+
+// Producer: check the response against each active key.
+bool ok = wh.isValidEndpointVerificationResponse(challenge, responseHeader);
+```
+
+`verifyEndpointVerificationResponse` is the throwing form of the producer check.
 
 ## Security
 
